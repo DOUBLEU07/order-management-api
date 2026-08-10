@@ -1,42 +1,41 @@
 # Order Management API
 
-A small order/inventory REST API built with **FastAPI** (async) + **PostgreSQL**
-(async SQLAlchemy ORM) + **Redis**, running in Docker.
+A simple REST API for managing products and orders — built with **FastAPI**,
+**PostgreSQL** (through an async SQLAlchemy ORM), and **Redis** for caching.
+Runs in Docker, so you don't need anything installed locally except Docker
+itself.
 
-## How the code is organized
+## Project layout
 
 ```
 app/
-├── main.py           # FastAPI app + lifespan (creates tables on startup)
-├── core/              # config, DB session, Redis client
-├── models/            # SQLAlchemy ORM models (Product, Order, OrderItem)
-├── schemas/           # Pydantic request/response models
-├── services/          # business logic (ProductService, OrderService) — talks
-│                       # to the DB session and Redis directly, no repository
-│                       # abstraction layer
-└── routers/            # FastAPI routes — thin, just call a service and map
-                        # domain exceptions to HTTP status codes
+├── main.py       # creates the FastAPI app, wires up the routes
+├── core/         # config, DB session, Redis client
+├── models/       # SQLAlchemy models (Product, Order, OrderItem)
+├── schemas/      # Pydantic models for request/response validation
+├── services/     # the actual business logic (stock checks, caching, etc.)
+└── routers/      # the HTTP endpoints — kept thin on purpose
 ```
 
-`routers` stay thin (HTTP concerns only), `services` hold all the business
-logic and are the only place that touches SQLAlchemy/Redis, `models` and
-`schemas` are kept separate so the API's public shape (Pydantic) can evolve
-independently of the DB table shape (SQLAlchemy).
+The routes don't talk to the database or Redis directly — they call into
+`services`, which is where all the real logic lives. That keeps each layer
+easy to reason about on its own.
 
-## What it demonstrates
+## A few things worth knowing about how it works
 
-- **Async stack end-to-end**: FastAPI `async def` routes, SQLAlchemy 2.0 async
-  engine + `asyncpg`, `redis.asyncio`.
-- **Transaction safety**: one DB session per request (`get_db`), committed once
-  at the end — so "create order" (which decrements stock across multiple
-  products) either fully succeeds or fully rolls back.
-- **Atomic stock decrement**: a single `UPDATE ... WHERE stock_qty >= qty`
-  statement, safe under concurrent orders without explicit row locking.
-- **Redis cache-aside**: `GET /products` and `GET /products/{id}` are cached
-  with a TTL; any write (create/update product, or an order that changes
-  stock) invalidates the affected keys.
+- **One DB transaction per request.** If creating an order fails partway
+  through (say, one of the products is out of stock), everything gets rolled
+  back — you never end up with a half-finished order.
+- **Stock never goes negative, even under load.** Decrementing stock is done
+  as a single `UPDATE ... WHERE stock_qty >= qty` query, so two orders hitting
+  the same product at the same time can't both succeed and push stock below
+  zero.
+- **Product reads are cached in Redis.** `GET /products` and
+  `GET /products/{id}` check Redis first before hitting Postgres. Any write
+  that changes product data (creating/updating a product, or placing an
+  order) clears the relevant cache entries right away.
 
-## How to run it
+## Running it
 
 ```bash
 cp .env.example .env   # already done in this repo for local dev
@@ -44,7 +43,7 @@ docker compose up --build
 ```
 
 - API: http://localhost:8000
-- Swagger: http://localhost:8000/docs
+- Interactive docs: http://localhost:8000/docs
 
 ## Endpoints
 
@@ -53,12 +52,7 @@ docker compose up --build
 | POST   | /products        | create a product                          |
 | GET    | /products        | list products (cached)                    |
 | GET    | /products/{id}   | get one product (cached)                  |
-| PUT    | /products/{id}   | update a product (invalidates cache)      |
-| POST   | /orders          | create an order (checks/decrements stock) |
+| PUT    | /products/{id}   | update a product (clears its cache)       |
+| POST   | /orders          | place an order (checks/decrements stock)  |
 | GET    | /orders          | list orders                               |
 | GET    | /orders/{id}     | get one order                             |
-
-## Out of scope
-
-Auth/JWT, rate limiting, Redis pub/sub, and a background job queue were left
-out to keep this small.
